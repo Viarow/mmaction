@@ -1,5 +1,8 @@
 import argparse
-
+import numpy as np
+import pickle
+import cv2
+import os
 import torch
 import mmcv
 from mmcv.runner import load_checkpoint, parallel_test, obj_from_dict
@@ -15,6 +18,7 @@ from mmaction.core.evaluation.accuracy import (softmax, top_k_accuracy,
 def single_test(model, data_loader):
     model.eval()
     results = []
+    inputs = []
     dataset = data_loader.dataset
     prog_bar = mmcv.ProgressBar(len(dataset))
     for i, data in enumerate(data_loader):
@@ -23,9 +27,16 @@ def single_test(model, data_loader):
         results.append(result)
 
         batch_size = data['img_group_0'].data[0].size(0)
+        inputs.append(data['img_group_0'].data[0].squeeze())
         for _ in range(batch_size):
             prog_bar.update()
-    return results
+        
+        #print("\n")
+        #print("*************************")
+        #print(len(data['img_group_0'].data))
+        #print(data['img_group_0'].data[0].size())
+        
+    return results, inputs
 
 
 def _data_func(data, device_id):
@@ -49,8 +60,61 @@ def parse_args():
                         help='whether to use softmax score')
     args = parser.parse_args()
     return args
+    
+    
+def get_top_5_index(results_path, video_num):
+    results = pickle.load(open(results_path,'rb'),encoding='utf-8')
+    result = results[video_num]
+    sorted_score = np.sort(result)
+    sorted_index = np.argsort(result)
+    top_scores = sorted_score[0][-5:]
+    top_index = sorted_index[0][-5:]
 
+    top_index = np.flip(top_index)
+    return top_index
+    
 
+def returnCAM(feat_conv, weight_softmax, class_idx):
+    size_upsample = (224, 224)        # decide on the input_size in tsn_rgb_bninception.py
+    bz, nc, h, w = feat_conv.shape
+    output_cam = []
+    idx = class_idx[0]
+    for snippet in range(0, bz):
+        features = feat_conv[snippet]
+        cam = weight_softmax[idx].dot(features.reshape((nc, h*w)))
+        cam = cam.reshape(h, w)
+        cam = cam - np.min(cam)
+        cam_img = cam / np.max(cam)
+        cam_img = np.uint8(255 * cam_img)
+        output_cam.append(cv2.resize(cam_img, size_upsample))
+    return output_cam
+    
+    
+def numpy_2_image(array):
+    channels = []
+    for i in range(0, 3):
+        layer = array[i]
+        layer = layer - np.min(layer)
+        channel = layer / np.max(layer)
+        channel = np.uint8(255 * channel)
+        channels.append(channel)
+    img = cv2.merge(channels)
+    return img
+    
+    
+def writeCAMs(class_name, CAMs, imgs, video_idx):
+    bz, nc, h, w = imgs.shape
+    assert len(CAMs) == bz
+    for snippet in range(0, bz):
+        img = imgs[snippet]
+        img = numpy_2_image(img)
+        CAM = CAMs[snippet]
+        heatmap = cv2.applyColorMap(CAM, cv2.COLORMAP_JET)
+        result = heatmap * 0.3 + img * 0.5
+        cv2.imwrite('data/CAM_imgs/'+ class_name +'/CAMs_{:02d}/cam_{:03d}.jpg'.format(video_idx, snippet), result)
+       
+        
+        
 def main():
     args = parse_args()
 
@@ -71,7 +135,10 @@ def main():
         model = build_recognizer(
             cfg.model, train_cfg=None, test_cfg=cfg.test_cfg)
         load_checkpoint(model, args.checkpoint, strict=True)
-        model = MMDataParallel(model, device_ids=[0])
+        model = MMDataParallel(model, device_ids=[1])
+        
+        params = list(model.parameters())
+        weight_softmax = np.squeeze(params[-2].data.cpu().numpy())       # fully conneted layer parameters to numpy already
 
         data_loader = build_dataloader(
             dataset,
@@ -80,7 +147,7 @@ def main():
             num_gpus=1,
             dist=False,
             shuffle=False)
-        outputs = single_test(model, data_loader)
+        outputs, inputs = single_test(model, data_loader)
     else:
         model_args = cfg.model.copy()
         model_args.update(train_cfg=None, test_cfg=cfg.test_cfg)
@@ -93,10 +160,27 @@ def main():
             _data_func,
             range(args.gpus),
             workers_per_gpu=args.proc_per_gpu)
+            
+    #print(len(features_blobs))
+    #print(features_blobs[0].size())
 
     if args.out:
         print('writing results to {}'.format(args.out))
         mmcv.dump(outputs, args.out)
+
+    num_videos = len(outputs)
+    class_name = 'YoYo'
+    os.mkdir('data/CAM_imgs/' + class_name)
+
+    for k in range(0, num_videos):
+        os.mkdir('data/CAM_imgs/'+ class_name + '/CAMs_{:02d}'.format(k))
+        idx = get_top_5_index("tools/results.pkl", k)  # change the dir of results.pkl to tools/
+        conv_feat = pickle.load(open("tools/hook_features/feat_{:02d}.pkl".format(k), 'rb'), encoding='utf-8')
+        conv_feat = conv_feat.cpu().numpy()
+        CAMs = returnCAM(conv_feat, weight_softmax,
+                         [idx[0]])  # generate class activation mapping for the top1 prediction
+        single_input = inputs[k].numpy()
+        writeCAMs(class_name, CAMs, single_input, k)
 
     gt_labels = []
     for i in range(len(dataset)):
@@ -116,6 +200,13 @@ def main():
     print("Mean Class Accuracy = {:.02f}".format(mean_acc * 100))
     print("Top-1 Accuracy = {:.02f}".format(top1 * 100))
     print("Top-5 Accuracy = {:.02f}".format(top5 * 100))
+    # print("*********model._modules.keys**********")
+    # print(model._modules.keys())
+    # print("*********model.children**********")
+    # print(list(model.children()))
+    # print("*********model's parameters**********")
+    # for name, param in model.named_parameters():
+    #     print(name, param.data.size())
 
 
 if __name__ == '__main__':

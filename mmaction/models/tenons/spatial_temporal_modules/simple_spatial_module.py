@@ -16,7 +16,7 @@ class SimpleSpatialModule(nn.Module):
 
         if self.spatial_type == 'avg':
             self.op = nn.AvgPool2d(self.spatial_size, stride=1, padding=0)
-
+            #self.op = nn.AdaptiveAvgPool2d(1)
 
     def init_weights(self):
         pass

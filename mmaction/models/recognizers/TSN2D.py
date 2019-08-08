@@ -2,6 +2,7 @@ import torch.nn as nn
 from .base import BaseRecognizer
 from .. import builder
 from ..registry import RECOGNIZERS
+import mmcv
 
 
 @RECOGNIZERS.register_module
@@ -21,6 +22,7 @@ class TSN2D(BaseRecognizer):
         self.backbone = builder.build_backbone(backbone)
         self.modality = modality
         self.in_channels = in_channels
+        self.feat_num = 0
 
         if spatial_temporal_module is not None:
             self.spatial_temporal_module = builder.build_spatial_temporal_module(
@@ -143,13 +145,25 @@ class TSN2D(BaseRecognizer):
         num_seg = img_group.shape[0] // bs
 
         x = self.extract_feat(img_group)
+        mmcv.dump(x, '/home/jlyu4/mmaction/tools/hook_features/feat_{:02d}.pkl'.format(self.feat_num))
+        self.feat_num = self.feat_num+1
+        #print("After backbone")
+        #print(x.shape)
         if self.with_spatial_temporal_module:
             x = self.spatial_temporal_module(x)
+        #print("After avgPooling")
+        #print(x.shape)
         x = x.reshape((-1, num_seg) + x.shape[1:])
+        #print("After reshape")
+        #print(x.shape)
         if self.with_segmental_consensus:
             x = self.segmental_consensus(x)
             x = x.squeeze(1)
+        #print("after consensus")
+        #print(x.shape)
         if self.with_cls_head:
             x = self.cls_head(x)
+        #print("after cls_head")
+        #print(x.shape)
 
         return x.cpu().numpy()
